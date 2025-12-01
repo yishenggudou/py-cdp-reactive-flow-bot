@@ -1,6 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+# @time    : 2024/8/21 16:32
+# @author  : timger/yishenggudou
 import asyncio
 import re
 from typing import Any, Dict, List, Callable, Optional
@@ -11,6 +12,8 @@ from rx.core import Observable
 from rx.subject import Subject
 from rx.scheduler.eventloop import AsyncIOScheduler
 from playwright.async_api import async_playwright, Page, BrowserContext
+import logging
+logger = logging.getLogger(__name__)
 
 class TaskState(Enum):
     PENDING = "pending"
@@ -42,17 +45,51 @@ class ReactiveAutomationFramework:
         self.current_context: Optional[ExecutionContext] = None
         self.scheduler = AsyncIOScheduler()
         
-    async def initialize(self):
-        """初始化浏览器环境"""
+    async def initialize(self, cdp_endpoint: Optional[str] = None):
+        """初始化浏览器环境
+        
+        Args:
+            cdp_endpoint: 可选的CDP服务端点地址，如果提供则连接到现有浏览器实例，
+                         否则启动一个新的浏览器实例
+        """
+        logger.debug("开始初始化浏览器环境...")
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=False,
-            args=['--disable-blink-features=AutomationControlled']
-        )
-        self.context = await self.browser.new_context()
+        logger.debug("Playwright启动成功")
+        
+        if cdp_endpoint:
+            # 连接到现有的CDP端点
+            logger.debug(f"连接到CDP端点: {cdp_endpoint}")
+            self.browser = await self.playwright.chromium.connect_over_cdp(cdp_endpoint)
+            logger.debug("成功连接到CDP端点")
+            
+            # 获取第一个上下文，如果没有则创建新的
+            contexts = self.browser.contexts
+            if contexts:
+                self.context = contexts[0]
+                logger.debug("使用现有浏览器上下文")
+            else:
+                self.context = await self.browser.new_context()
+                logger.debug("创建新的浏览器上下文")
+        else:
+            # 启动新的浏览器实例
+            logger.debug("启动新的Chrome浏览器实例")
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            logger.debug("Chrome浏览器启动成功")
+            
+            self.context = await self.browser.new_context()
+            logger.debug("浏览器上下文创建成功")
         
     def create_dsl_executor(self, dsl_config: Dict) -> Observable:
         """基于DSL配置创建可观察执行流"""
+        logger.debug(f"创建DSL执行器，配置: {dsl_config.get('name', 'unnamed')}")
+        # 确保浏览器已初始化
+        if not self.browser:
+            logger.error("创建执行器失败：浏览器未初始化")
+            raise RuntimeError("Browser not initialized. Call initialize() first.")
+        
         return Observable.create(lambda observer: self._execute_dsl_pipeline(observer, dsl_config))
     
     async def _execute_dsl_pipeline(self, observer, dsl_config: Dict):
@@ -96,58 +133,118 @@ class ReactiveAutomationFramework:
         )
     
     def _create_step_observable(self, step: Dict, step_index: int) -> Observable:
-        """为每个步骤创建可观察对象"""
-        return Observable.defer(
-            lambda: self._execute_single_step(step, step_index)
-        ).pipe(
-            ops.retry(step.get("max_retries", 3)),  # 重试机制
-            ops.timeout(step.get("timeout", 30000)),  # 超时控制
+        """为每个步骤创建可观察对象，支持每个step自定义重试和超时设置
+        
+        支持不限超时的情况：当timeout设置为0或None时，表示不应用超时控制，
+        适用于需要等待任意长时间直到条件满足的场景，类似于Playwright的wait_for_selector无超时模式。
+        """
+        logger.debug(f"创建步骤可观察对象 #{step_index}: {step.get('type', 'unknown')}，名称: {step.get('name', 'unnamed')}")
+        # 从step配置中获取重试和超时参数，每个step可以完全自定义这些值
+        max_retries = step.get("max_retries", 3)  # 最大重试次数，默认3次
+        timeout = step.get("timeout", 30000)  # 超时时间，默认30秒，设置为0或None表示不限超时
+        
+        # 日志记录配置，特别标记不限超时的情况
+        timeout_info = "无超时限制" if timeout == 0 or timeout is None else f"{timeout}ms"
+        logger.debug(f"  步骤配置: max_retries={max_retries}, timeout={timeout_info}")
+        
+        # 创建一个包装器，在重试时更新状态
+        def execute_with_retry_state_update():
+            try:
+                return self._execute_single_step(step, step_index)
+            except Exception as e:
+                # 更新状态为失败
+                self._emit_state_update(step_index, TaskState.FAILED, str(e))
+                # 重新抛出异常以触发重试机制
+                raise
+        
+        # 创建步骤可观察对象
+        step_observable = Observable.defer(execute_with_retry_state_update)
+        
+        # 应用超时控制（仅当timeout不为0或None时）
+        if timeout != 0 and timeout is not None:
+            step_observable = step_observable.pipe(
+                ops.timeout(timeout)
+            )
+        else:
+            logger.debug(f"  步骤 #{step_index}: 已启用无超时限制模式")
+        
+        # 应用自定义重试机制（如果配置了重试）
+        if max_retries > 0:
+            # 使用RxPy的retry操作符并传入最大重试次数
+            step_observable = step_observable.pipe(
+                ops.retry(max_retries)
+            )
+        
+        # 添加状态更新监听器
+        step_observable = step_observable.pipe(
             ops.do_action(
-                on_next=lambda result: self._emit_state_update(step_index, TaskState.RUNNING, result),
-                on_error=lambda error: self._emit_state_update(step_index, TaskState.FAILED, error)
+                on_next=lambda result: self._emit_state_update(step_index, TaskState.RUNNING, result)
             )
         )
+        
+        return step_observable
     
     async def _execute_single_step(self, step: Dict, step_index: int) -> Dict[str, Any]:
         """执行单个步骤"""
         step_type = step["type"]
+        step_name = step.get("name", f"step_{step_index}")
+        logger.debug(f"执行步骤 #{step_index}: {step_type} (名称: {step_name})")
+        
         context = self.current_context
         
         self._emit_state_update(step_index, TaskState.RUNNING)
         
         try:
             if step_type == "navigate":
-                await context.page.goto(step["url"])
-                result = {"type": "navigation", "url": step["url"], "status": "success"}
+                url = step["url"]
+                logger.debug(f"  导航到: {url}")
+                await context.page.goto(url)
+                logger.debug(f"  导航成功")
+                result = {"type": "navigation", "url": url, "status": "success"}
                 
             elif step_type == "click":
                 selector = step["selector"]
+                logger.debug(f"  点击元素: {selector}")
                 await context.page.click(selector)
+                logger.debug(f"  点击成功")
                 result = {"type": "click", "selector": selector, "status": "success"}
                 
             elif step_type == "type":
                 selector = step["selector"]
                 text = step["text"]
+                logger.debug(f"  在元素 {selector} 中输入文本: {text[:20]}{'...' if len(text) > 20 else ''}")
                 await context.page.fill(selector, text)
+                logger.debug(f"  文本输入成功")
                 result = {"type": "type", "selector": selector, "text": text, "status": "success"}
                 
             elif step_type == "wait_for_pattern":
                 pattern = step["pattern"]
+                logger.debug(f"  等待模式匹配: {pattern['type']} = {pattern['value']}")
                 match_result = await self._wait_for_pattern(pattern)
+                logger.debug(f"  模式匹配结果: {match_result['matched']}")
                 result = {"type": "pattern_match", "pattern": pattern, "match": match_result}
                 
             elif step_type == "extract_data":
                 extraction_config = step["extract"]
+                logger.debug(f"  提取数据，配置项数量: {len(extraction_config)}")
                 extracted_data = await self._extract_data(extraction_config)
+                logger.debug(f"  数据提取成功，提取字段数: {len(extracted_data)}")
                 result = {"type": "extraction", "data": extracted_data}
                 
             elif step_type == "conditional":
-                condition_result = await self._evaluate_condition(step["condition"])
-                result = {"type": "conditional", "condition": step["condition"], "result": condition_result}
+                condition = step["condition"]
+                logger.debug(f"  评估条件: {condition['type']}")
+                condition_result = await self._evaluate_condition(condition)
+                logger.debug(f"  条件评估结果: {condition_result}")
+                result = {"type": "conditional", "condition": condition, "result": condition_result}
                 
             elif step_type == "cdp_command":
-                cdp_result = await self._execute_cdp_command(step["command"], step.get("params", {}))
-                result = {"type": "cdp", "command": step["command"], "result": cdp_result}
+                command = step["command"]
+                params = step.get("params", {})
+                logger.debug(f"  执行CDP命令: {command}")
+                cdp_result = await self._execute_cdp_command(command, params)
+                logger.debug(f"  CDP命令执行成功")
+                result = {"type": "cdp", "command": command, "result": cdp_result}
                 
             else:
                 raise ValueError(f"未知的步骤类型: {step_type}")
@@ -156,10 +253,12 @@ class ReactiveAutomationFramework:
             context.last_result = result
             context.state["current_step"] = step_index
             
+            logger.debug(f"  步骤 #{step_index} 执行成功")
             self._emit_state_update(step_index, TaskState.SUCCESS, result)
             return result
             
         except Exception as e:
+            logger.debug(f"  步骤 #{step_index} 执行失败: {str(e)}")
             self._emit_state_update(step_index, TaskState.FAILED, str(e))
             raise
     
@@ -288,6 +387,7 @@ class ReactiveAutomationFramework:
             "result": result,
             "timestamp": asyncio.get_event_loop().time()
         }
+        logger.debug(f"状态更新: 步骤 #{step_index} -> {state.name}")
         self.state_stream.on_next(update)
     
     async def _start_execution(self, execution_flow: Observable):
@@ -297,7 +397,13 @@ class ReactiveAutomationFramework:
     
     async def close(self):
         """关闭框架"""
+        logger.debug("开始关闭框架...")
         if self.browser:
+            logger.debug("关闭浏览器...")
             await self.browser.close()
+            logger.debug("浏览器已关闭")
         if self.playwright:
+            logger.debug("关闭Playwright...")
             await self.playwright.stop()
+            logger.debug("Playwright已关闭")
+        logger.debug("框架关闭完成")
