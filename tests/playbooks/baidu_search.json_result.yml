@@ -1,0 +1,92 @@
+name: "百度搜索并返回JSON结果"
+description: "导航到百度，执行搜索并以JSON格式返回搜索结果"
+timeout: 120  # 执行超时时间（秒）
+
+steps:
+  - name: "导航到百度首页"
+    type: "navigate"
+    url: "https://www.baidu.com"
+    max_retries: 2
+    timeout: 10000
+
+  - name: "输入搜索关键词"
+    type: "type"
+    selector: "#kw"
+    text: "CDP自动化测试"
+    max_retries: 1
+    timeout: 5000
+
+  - name: "点击搜索按钮"
+    type: "click"
+    selector: "#su"
+    max_retries: 2
+    timeout: 5000
+
+  - name: "等待搜索结果加载"
+    type: "wait_for_pattern"
+    pattern:
+      type: "element"
+      value: ".result-op"
+    timeout: 10000
+
+  - name: "提取搜索结果数据"
+    type: "extract_data"
+    extract:
+      search_results:
+        method: "evaluate_js"
+        expression: >
+          (function() {
+            const results = [];
+            document.querySelectorAll('.result.c-container').forEach((item, index) => {
+              if (index < 10) { // 只提取前10条结果
+                const title = item.querySelector('h3 a') ? item.querySelector('h3 a').textContent : '';
+                const url = item.querySelector('h3 a') ? item.querySelector('h3 a').href : '';
+                const summary = item.querySelector('.c-abstract') ? item.querySelector('.c-abstract').textContent : '';
+                results.push({
+                  title: title,
+                  url: url,
+                  summary: summary,
+                  rank: index + 1
+                });
+              }
+            });
+            return results;
+          })()
+      page_title:
+        method: "evaluate_js"
+        expression: "document.title"
+      search_count:
+        method: "evaluate_js"
+        expression: "document.querySelectorAll('.result.c-container').length"
+
+  - name: "返回JSON格式结果"
+    type: "extract_data"
+    extract:
+      json_result:
+        method: "evaluate_js"
+        expression: >
+          (function() {
+            const results = [];
+            document.querySelectorAll('.result.c-container').forEach((item, index) => {
+              if (index < 10) {
+                const title = item.querySelector('h3 a') ? item.querySelector('h3 a').textContent : '';
+                const url = item.querySelector('h3 a') ? item.querySelector('h3 a').href : '';
+                const summary = item.querySelector('.c-abstract') ? item.querySelector('.c-abstract').textContent : '';
+                results.push({
+                  title: title,
+                  url: url,
+                  summary: summary,
+                  rank: index + 1
+                });
+              }
+            });
+            
+            return JSON.stringify({
+              status: "success",
+              search_query: "CDP自动化测试",
+              total_results: document.querySelectorAll('.result.c-container').length,
+              extracted_results: results,
+              page_title: document.title,
+              timestamp: new Date().toISOString()
+            }, null, 2);
+          })()

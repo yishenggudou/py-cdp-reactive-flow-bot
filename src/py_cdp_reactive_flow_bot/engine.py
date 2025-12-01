@@ -7,6 +7,8 @@ import re
 from typing import Any, Dict, List, Callable, Optional
 from enum import Enum
 from dataclasses import dataclass
+import asyncio
+import rx
 from rx import operators as ops
 from rx.core import Observable
 from rx.subject import Subject
@@ -36,14 +38,15 @@ class PatternMatch:
     timeout: int = 5000
 
 class ReactiveAutomationFramework:
-    def __init__(self):
+    def __init__(self, cdp_endpoint: Optional[str] = None):
         self.playwright = None
         self.browser = None
         self.context = None
         self.event_stream = Subject()
         self.state_stream = Subject()
         self.current_context: Optional[ExecutionContext] = None
-        self.scheduler = AsyncIOScheduler()
+        self.cdp_endpoint: Optional[str] = cdp_endpoint
+        self.scheduler = AsyncIOScheduler(loop=asyncio.get_event_loop())
         
     async def initialize(self, cdp_endpoint: Optional[str] = None):
         """初始化浏览器环境
@@ -55,7 +58,7 @@ class ReactiveAutomationFramework:
         logger.debug("开始初始化浏览器环境...")
         self.playwright = await async_playwright().start()
         logger.debug("Playwright启动成功")
-        
+        cdp_endpoint = cdp_endpoint or self.cdp_endpoint
         if cdp_endpoint:
             # 连接到现有的CDP端点
             logger.debug(f"连接到CDP端点: {cdp_endpoint}")
@@ -90,7 +93,7 @@ class ReactiveAutomationFramework:
             logger.error("创建执行器失败：浏览器未初始化")
             raise RuntimeError("Browser not initialized. Call initialize() first.")
         
-        return Observable.create(lambda observer: self._execute_dsl_pipeline(observer, dsl_config))
+        return rx.create(lambda observer, scheduler: self._execute_dsl_pipeline(observer, dsl_config))
     
     async def _execute_dsl_pipeline(self, observer, dsl_config: Dict):
         """执行DSL任务管道"""
