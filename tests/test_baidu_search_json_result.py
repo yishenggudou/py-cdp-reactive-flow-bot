@@ -20,7 +20,7 @@ async def test_baidu_search_json_result():
 
         # 2. 初始化自动化框架
         framework = ReactiveAutomationFramework()
-        await framework.initialize('http://127.0.0.1:9222')  # 使用默认浏览器，不指定CDP端点
+        await framework.initialize()  # 使用默认浏览器，不指定CDP端点
 
         # 3. 创建执行器并执行playbook
         executor = await framework.create_dsl_executor(playbook_config)
